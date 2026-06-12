@@ -1,10 +1,10 @@
-import json
 import socket
 import time
-from urllib import error, request
+from urllib import error
 
 from helpers.app_logging import get_logger
 from helpers.config_reader import ConfigError, load_yaml_config
+from helpers.matfix import send_matfix_message
 from helpers.timezone_utils import format_timestamp, get_server_timezone
 
 
@@ -31,9 +31,6 @@ def _normalize_action_key(key):
 def _load_pochino_config():
 	config = load_yaml_config("pochino.yaml")
 
-	if not isinstance(config.get("matfix_url"), str) or not config.get("matfix_url").strip():
-		raise ConfigError("pochino.yaml: matfix_url is required")
-
 	if not isinstance(config.get("api_key"), str) or not config.get("api_key").strip():
 		raise ConfigError("pochino.yaml: api_key is required")
 
@@ -55,40 +52,11 @@ def _load_pochino_config():
 			normalized_messages[normalized_key] = message_value
 
 	return {
-		"matfix_url": config["matfix_url"].rstrip("/"),
 		"api_key": config["api_key"],
 		"account_id": config["account_id"],
 		"room_ids": room_ids,
 		"messages": normalized_messages,
-		"request_timeout_seconds": int(config.get("request_timeout_seconds", 5)),
 	}
-
-
-def _send_matfix_message(matfix_url, api_key, account_id, room_id, message, timeout):
-	url = f"{matfix_url}/v1/send"
-	payload = json.dumps(
-		{
-			"account_id": account_id,
-			"destination": room_id,
-			"message": {
-				"type": "text",
-				"body": message,
-			},
-		}
-	).encode("utf-8")
-
-	req = request.Request(
-		url,
-		data=payload,
-		method="POST",
-		headers={
-			"Authorization": f"Bearer {api_key}",
-			"Content-Type": "application/json",
-		},
-	)
-	with request.urlopen(req, timeout=timeout) as resp:
-		return resp.status
-
 
 def _resolve_device_name(handler):
 	device_name = handler.headers.get("X-Pochino-Device", "").strip()
@@ -129,13 +97,14 @@ def handle(handler):
 
 	for room_id in config["room_ids"]:
 		try:
-			status = _send_matfix_message(
-				config["matfix_url"],
+			status = send_matfix_message(
 				config["api_key"],
 				config["account_id"],
 				room_id,
-				full_message,
-				config["request_timeout_seconds"],
+				{
+					"type": "text",
+					"body": full_message,
+				},
 			)
 			if status != 202:
 				failures.append(f"{room_id} (status={status})")

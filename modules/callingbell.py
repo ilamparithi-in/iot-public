@@ -1,10 +1,11 @@
 import json
 import threading
 import time
-from urllib import error, request
+from urllib import error
 
 from helpers.app_logging import get_logger
 from helpers.config_reader import ConfigError, load_yaml_config
+from helpers.matfix import send_matfix_message
 from helpers.timezone_utils import format_timestamp, get_server_timezone
 
 
@@ -55,9 +56,6 @@ def _load_callingbell_config():
         token_location_pairs[normalized_token] = normalized_location
         seen_locations.add(normalized_location)
 
-    if not isinstance(config.get("matfix_url"), str) or not config.get("matfix_url").strip():
-        raise ConfigError("callingbell.yaml: matfix_url is required")
-
     if not isinstance(config.get("api_key"), str) or not config.get("api_key").strip():
         raise ConfigError("callingbell.yaml: api_key is required")
 
@@ -82,27 +80,13 @@ def _load_callingbell_config():
     if clear_seen_events_after_hours <= 0:
         raise ConfigError("callingbell.yaml: clear_seen_events_after_hours must be greater than 0")
 
-    request_timeout_seconds = config.get("request_timeout_seconds", 5)
-    if isinstance(request_timeout_seconds, bool):
-        raise ConfigError("callingbell.yaml: request_timeout_seconds must be a number")
-
-    try:
-        request_timeout_seconds = int(request_timeout_seconds)
-    except (TypeError, ValueError):
-        raise ConfigError("callingbell.yaml: request_timeout_seconds must be an integer")
-
-    if request_timeout_seconds <= 0:
-        raise ConfigError("callingbell.yaml: request_timeout_seconds must be greater than 0")
-
     return {
         "token_location_pairs": token_location_pairs,
-        "matfix_url": config["matfix_url"].rstrip("/"),
         "api_key": config["api_key"],
         "account_id": config["account_id"],
         "room_ids": [item.strip() for item in room_ids],
         "message_template": message_template,
         "clear_seen_events_after_hours": clear_seen_events_after_hours,
-        "request_timeout_seconds": request_timeout_seconds,
     }
 
 
@@ -160,32 +144,6 @@ def _format_event_time(timestamp):
 
 def _build_message(template, timestamp, place):
     return template.replace("{{time}}", _format_event_time(timestamp)).replace("{{place}}", place)
-
-
-def _send_matfix_message(matfix_url, api_key, account_id, room_id, message, timeout):
-    url = f"{matfix_url}/v1/send"
-    payload = json.dumps(
-        {
-            "account_id": account_id,
-            "destination": room_id,
-            "message": {
-                "type": "text",
-                "body": message,
-            },
-        }
-    ).encode("utf-8")
-
-    req = request.Request(
-        url,
-        data=payload,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-    )
-    with request.urlopen(req, timeout=timeout) as resp:
-        return resp.status
 
 
 def _extract_bearer_token(handler):
@@ -248,13 +206,14 @@ def handle(handler):
 
     for room_id in config["room_ids"]:
         try:
-            status = _send_matfix_message(
-                config["matfix_url"],
+            status = send_matfix_message(
                 config["api_key"],
                 config["account_id"],
                 room_id,
-                message,
-                config["request_timeout_seconds"],
+                {
+                    "type": "text",
+                    "body": message,
+                },
             )
             if status != 202:
                 failures.append(f"{room_id} (status={status})")

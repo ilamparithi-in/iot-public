@@ -2,6 +2,9 @@ server:
   host: 0.0.0.0
   port: 8000
   timezone: UTC
+matfix:
+  url: "http://matfix.example.com"
+  request_timeout: 5
 logging:
   level: INFO
   file: logs/iot.log
