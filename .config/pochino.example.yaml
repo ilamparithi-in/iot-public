@@ -1,0 +1,10 @@
+matfix_url: "http://matfix.example.com"
+api_key: matfixctl keys create --name "pochino" --routes send --accounts bot1
+account_id: "bot1"
+messages:
+  on: "⚡ Power restored!"
+  off: "⚠️ Power cut detected. System switched to backup. Possible shutdown in 5 minutes!"
+room_ids:
+    - "!vpqhtfzWmiyHSURqdq:10082006.xyz"
+    - "!xYLgsLeNJMpOWoAXnp:10082006.xyz"
+request_timeout_seconds: 30

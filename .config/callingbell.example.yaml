@@ -1,0 +1,13 @@
+provisioned_tokens:
+  - token: generate your own token and place it here
+    location: X-Bell-Location header value to match
+clear_seen_events_after_hours: 2
+message_template: "Calling Bell was rung at {{time}} at {{place}}"
+
+matfix_url: "http://matfix.example.com"
+api_key: matfixctl keys create --name "callingbell" --routes send --accounts bot1
+account_id: "bot1"
+room_ids:
+  - "!replace-with-room-id:example.org"
+
+request_timeout_seconds: 5

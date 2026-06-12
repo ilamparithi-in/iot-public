@@ -1,0 +1,10 @@
+services:
+  iot-server:
+    build: .
+    container_name: iot-server
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./logs:/app/logs
+      - ./.config:/app/.config:ro
