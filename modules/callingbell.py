@@ -315,7 +315,7 @@ def _parse_event_payload(handler):
 
 def _clear_expired_events(max_age_seconds):
     cutoff = time.time() - max_age_seconds
-    expired_event_ids = [event_id for event_id, seen_at in _seen_event_ids.items() if seen_at < cutoff]
+    expired_event_ids = [event_id for event_id, info in _seen_event_ids.items() if info[0] < cutoff]
 
     for event_id in expired_event_ids:
         del _seen_event_ids[event_id]
@@ -383,9 +383,10 @@ def handle(handler):
 
         if event_id in _seen_event_ids:
             logger.info("Callingbell ignored duplicate event id=%s", event_id)
-            _send_response(handler, 409)
+            _, prev_status = _seen_event_ids[event_id]
+            _send_response(handler, prev_status)
             return
-        _seen_event_ids[event_id] = time.time()
+        _seen_event_ids[event_id] = (time.time(), 200)
 
     place = expected_location
     message = _build_message(config["message_template"], timestamp, place)
@@ -481,10 +482,16 @@ def handle(handler):
 
     if failures:
         logger.warning("Callingbell delivery failed for event id=%s: %s", event_id, ", ".join(failures))
+        with _seen_event_ids_lock:
+            if event_id in _seen_event_ids:
+                _seen_event_ids[event_id] = (_seen_event_ids[event_id][0], 502)
         _send_response(handler, 502)
         return
 
     logger.info("Callingbell event id=%s delivered to %d rooms", event_id, len(config["room_ids"]))
+    with _seen_event_ids_lock:
+        if event_id in _seen_event_ids:
+            _seen_event_ids[event_id] = (_seen_event_ids[event_id][0], 200)
     _send_response(handler, 200)
 
 
