@@ -8,3 +8,10 @@ api_key: matfixctl keys create --name "callingbell" --routes send --accounts bot
 account_id: "bot1"
 room_ids:
   - "!replace-with-room-id:example.org"
+
+rtsp:
+  enabled: false
+  uri: "rtsp://user:password@camera/stream"
+  capture_threshold_seconds: 5
+  frame_buffer_seconds: 30
+  target_fps: 2
