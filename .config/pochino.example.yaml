@@ -6,3 +6,14 @@ messages:
 room_ids:
     - "!vpqhtfzWmiyHSURqdq:10082006.xyz"
     - "!xYLgsLeNJMpOWoAXnp:10082006.xyz"
+
+
+last_stable_state: "on:1719300000"
+fluctuation_count: 0
+debounce_seconds: 30
+
+# messages_today is automatically updated, do it manually only if needed
+alerts:
+  messages_today: 0 
+  last_reset_day: "2026-06-24"
+  max_messages_per_day: 50

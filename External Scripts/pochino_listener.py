@@ -73,10 +73,7 @@ def main() -> None:
                     raise
 
                 if line == "ON":
-                    if not initialized:
-                        initialized = True
-                    else:
-                        call_pochino_api("on")
+                    call_pochino_api("on")
                 elif line == "OFF":
                     call_pochino_api("off")
                 elif line == "HI":

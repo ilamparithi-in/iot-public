@@ -56,3 +56,29 @@ def get_config_value(key: str, default: Any = None, file_name: str = "app.yaml")
         current = current[part]
 
     return current
+
+def write_config_value(key: str, value: Any, file_name: str = "app.yaml") -> None:
+    """Use with caution, does not handle edge cases/checks"""
+
+    if not key:
+        raise ValueError("key must be a non-empty string")
+    
+    config_path = _resolve_config_path(file_name=file_name)
+    
+    if not config_path.exists():
+        raise ConfigError(f"Config file not found: {config_path}")
+
+    config = load_yaml_config(file_name=file_name)
+    current = config
+    parts = key.split(".")
+
+    for part in parts[:-1]:
+        current = current.setdefault(part, {})
+
+    current[parts[-1]] = value
+
+    try:
+        with config_path.open("w", encoding="utf-8") as f:
+            yaml.safe_dump(config, f, sort_keys=False)  
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"Failed to write config: {exc}") from exc
