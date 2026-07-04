@@ -119,6 +119,22 @@ class RTSPMonitor(threading.Thread):
             return closest_snapshot
 
 
+def _sanitize_rtsp_uri(uri: str) -> str:
+    import urllib.parse
+    if not uri:
+        return ""
+    try:
+        parsed = urllib.parse.urlparse(uri)
+        if parsed.username or parsed.password:
+            if "@" in parsed.netloc:
+                creds, host = parsed.netloc.rsplit("@", 1)
+                return parsed._replace(netloc=f"***:***@{host}").geturl()
+    except Exception:
+        pass
+    import re
+    return re.sub(r'^(rtsp[s]?://)[^@]+@', r'\1***:***@', uri, flags=re.IGNORECASE)
+
+
 _rtsp_monitor = None
 
 
@@ -128,7 +144,7 @@ def _initialize_rtsp_at_startup():
         config = _load_callingbell_config()
         rtsp_config = config.get("rtsp")
         if rtsp_config and rtsp_config.get("enabled"):
-            logger.info("Initializing RTSP Monitor with URI: %s", rtsp_config["uri"])
+            logger.info("Initializing RTSP Monitor with URI: %s", _sanitize_rtsp_uri(rtsp_config["uri"]))
             _rtsp_monitor = RTSPMonitor(
                 uri=rtsp_config["uri"],
                 frame_buffer_seconds=rtsp_config["frame_buffer_seconds"],
