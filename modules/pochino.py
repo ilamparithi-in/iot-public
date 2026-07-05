@@ -244,7 +244,7 @@ def debounce_worker(gen, act, ts, handler, config):
             except Exception:
                 logger.exception("Failed to write stable state 'off'")
 
-            send_alert(handler, "off", current_config, timestamp=ts)
+            send_alert(handler, "off", current_config, timestamp=outage_ts)
 
         elif act == "on":
             outage_start_timestamp = stable_timestamp if stable_state == "off" else ts
