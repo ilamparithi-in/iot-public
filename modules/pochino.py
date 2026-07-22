@@ -268,28 +268,35 @@ def handle_off(handler, config):
     now = time.time()
 
     with _lock:
+        try:
+            stable_state, _ = get_last_stable_state()
+        except Exception:
+            stable_state = "on"
+
         if _pending_state == "on":
-            try:
-                config_data = load_yaml_config("pochino.yaml")
-                fluctuation_count = config_data.get("fluctuation_count", 0)
-                fluctuation_count += 1
-                write_config_value("fluctuation_count", fluctuation_count, "pochino.yaml")
-                logger.info("Outage fluctuation detected. Fluctuation count incremented to %d", fluctuation_count)
-            except Exception:
-                logger.exception("Failed to update fluctuation count")
+            is_fluctuation = False
+            if stable_state == "off":
+                is_fluctuation = True
+            elif stable_state == "on" and _first_off_timestamp is not None:
+                is_fluctuation = True
+
+            if is_fluctuation:
+                try:
+                    config_data = load_yaml_config("pochino.yaml")
+                    fluctuation_count = config_data.get("fluctuation_count", 0)
+                    fluctuation_count += 1
+                    write_config_value("fluctuation_count", fluctuation_count, "pochino.yaml")
+                    logger.info("Outage fluctuation detected. Fluctuation count incremented to %d", fluctuation_count)
+                except Exception:
+                    logger.exception("Failed to update fluctuation count")
 
         _pending_state = "off"
         _pending_timestamp = now
         _generation += 1
         current_generation = _generation
 
-        try:
-            stable_state, _ = get_last_stable_state()
-            if stable_state == "on" and _first_off_timestamp is None:
-                _first_off_timestamp = now
-        except Exception:
-            if _first_off_timestamp is None:
-                _first_off_timestamp = now
+        if stable_state == "on" and _first_off_timestamp is None:
+            _first_off_timestamp = now
 
     debounce_seconds = config.get("debounce_seconds", 30)
 
