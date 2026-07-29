@@ -212,6 +212,7 @@ def _resolve_device_name(handler):
 def debounce_worker(gen, act, ts, handler, config):
     global _pending_state, _pending_timestamp, _generation, _first_off_timestamp
 
+    # --- Phase 1: snapshot state under lock (fast, no I/O) ---
     with _lock:
         if _generation != gen:
             logger.info("Debounce worker (generation %d, action %s) discarded: newer webhook received", gen, act)
@@ -220,47 +221,65 @@ def debounce_worker(gen, act, ts, handler, config):
             logger.info("Debounce worker (generation %d, action %s) discarded: pending state changed to %s", gen, act, _pending_state)
             return
 
+        # Capture and clear _first_off_timestamp atomically so no future
+        # cycle can accidentally reuse a stale value.
+        captured_first_off_ts = _first_off_timestamp
+        _first_off_timestamp = None
+
+    # --- Phase 2: read stable state (disk I/O, outside lock) ---
+    try:
+        stable_state, stable_timestamp = get_last_stable_state()
+    except Exception as exc:
+        logger.error("Failed to load last stable state: %s", exc)
+        stable_state, stable_timestamp = "on", int(ts)
+
+    if stable_state == act:
+        logger.info("State is already stable '%s', no transition needed", act)
+        return
+
+    logger.info("Transition to '%s' is stable", act)
+
+    try:
+        current_config = _load_pochino_config()
+    except Exception:
+        current_config = config
+
+    # --- Phase 3: perform transition (I/O-heavy, outside lock) ---
+    if act == "off":
+        # Use the first off timestamp from this outage cycle if available,
+        # otherwise fall back to this webhook's timestamp.
+        outage_ts = captured_first_off_ts if captured_first_off_ts is not None else ts
+
         try:
-            stable_state, stable_timestamp = get_last_stable_state()
-        except Exception as exc:
-            logger.error("Failed to load last stable state: %s", exc)
-            stable_state, stable_timestamp = "on", int(ts)
-
-        if stable_state == act:
-            logger.info("State is already stable '%s', no transition needed", act)
-            return
-
-        logger.info("Transition to '%s' is stable", act)
-
-        try:
-            current_config = _load_pochino_config()
+            set_last_stable_state("off", int(outage_ts))
         except Exception:
-            current_config = config
+            logger.exception("Failed to write stable state 'off'")
 
-        if act == "off":
-            outage_ts = _first_off_timestamp if _first_off_timestamp is not None else ts
-            try:
-                set_last_stable_state("off", int(outage_ts))
-            except Exception:
-                logger.exception("Failed to write stable state 'off'")
+        send_alert(handler, "off", current_config, timestamp=outage_ts)
 
-            send_alert(handler, "off", current_config, timestamp=outage_ts)
+    elif act == "on":
+        # Downtime = time from outage start to power-on webhook.
+        # Prefer the captured first-off timestamp (tracks the real outage start
+        # even across fluctuations), then the persisted stable-off timestamp.
+        if captured_first_off_ts is not None:
+            outage_start_timestamp = captured_first_off_ts
+        elif stable_state == "off":
+            outage_start_timestamp = stable_timestamp
+        else:
+            # stable_state is "on" and no first-off captured — shouldn't
+            # normally happen, but guard against it with zero downtime.
+            outage_start_timestamp = ts
 
-        elif act == "on":
-            outage_start_timestamp = stable_timestamp if stable_state == "off" else ts
-            downtime = int(ts - outage_start_timestamp)
+        downtime = max(0, int(ts - outage_start_timestamp))
+        fluctuations = current_config.get("fluctuation_count", 0)
 
-            fluctuations = current_config.get("fluctuation_count", 0)
+        send_alert(handler, "on", current_config, timestamp=ts, downtime=downtime, fluctuations=fluctuations)
 
-            send_alert(handler, "on", current_config, timestamp=ts, downtime=downtime, fluctuations=fluctuations)
-
-            try:
-                set_last_stable_state("on", int(ts))
-                write_config_value("fluctuation_count", 0, "pochino.yaml")
-            except Exception:
-                logger.exception("Failed to write stable state 'on' or reset fluctuations")
-
-            _first_off_timestamp = None
+        try:
+            set_last_stable_state("on", int(ts))
+            write_config_value("fluctuation_count", 0, "pochino.yaml")
+        except Exception:
+            logger.exception("Failed to write stable state 'on' or reset fluctuations")
 
 
 def handle_off(handler, config):
@@ -273,7 +292,12 @@ def handle_off(handler, config):
         except Exception:
             stable_state = "on"
 
-        if _pending_state == "on":
+        prev_pending = _pending_state
+
+        # Detect fluctuation: an "on" was pending (or we were in a mid-cycle
+        # after an earlier off), meaning power flickered back on briefly and
+        # is now going off again.
+        if prev_pending == "on":
             is_fluctuation = False
             if stable_state == "off":
                 is_fluctuation = True
@@ -295,7 +319,9 @@ def handle_off(handler, config):
         _generation += 1
         current_generation = _generation
 
-        if stable_state == "on" and _first_off_timestamp is None:
+        # Record the first "off" of this outage cycle. Only set if we're
+        # coming from a known-on state and haven't already recorded one.
+        if _first_off_timestamp is None and stable_state == "on":
             _first_off_timestamp = now
 
     debounce_seconds = config.get("debounce_seconds", 30)
@@ -312,7 +338,7 @@ def handle_off(handler, config):
 
 
 def handle_on(handler, config):
-    global _pending_state, _pending_timestamp, _generation
+    global _pending_state, _pending_timestamp, _generation, _first_off_timestamp
     now = time.time()
 
     with _lock:
