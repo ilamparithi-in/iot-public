@@ -14,24 +14,58 @@ from helpers.timezone_utils import format_timestamp, get_server_timezone
 ROUTE = "/pochino"
 logger = get_logger(__name__)
 
-# Runtime State (RAM only)
-_pending_state = None
-_pending_timestamp = 0.0
-_generation = 0
-_first_off_timestamp = None
+# Runtime State Machine (in-memory)
 _lock = threading.Lock()
+_pending_action: str | None = None
+_pending_since: float = 0.0
+_pending_device: str = ""
+_timer: threading.Timer | None = None
 
 
-## Stable state helpers ##
+## Helpers: Stable State & Fluctuation Persistence ##
 
-def get_last_stable_state():
-    config = load_yaml_config("pochino.yaml")
-    state, ts = config["last_stable_state"].split(":")
-    return state, int(ts)
+def _normalize_action_key(key):
+    if key is True:
+        return "on"
+    if key is False:
+        return "off"
+    return str(key).strip().lower()
 
 
-def set_last_stable_state(state: str, timestamp: int):
-    write_config_value("last_stable_state", f"{state}:{timestamp}", "pochino.yaml")
+def get_last_stable_state() -> tuple[str, int]:
+    try:
+        config = load_yaml_config("pochino.yaml")
+        raw = str(config.get("last_stable_state", "")).strip()
+        if ":" in raw:
+            state, ts = raw.split(":", 1)
+            state = _normalize_action_key(state)
+            if state in ("on", "off"):
+                return state, int(float(ts))
+    except Exception as exc:
+        logger.warning("Failed to load last_stable_state from pochino.yaml: %s", exc)
+    return "on", int(time.time())
+
+
+def set_last_stable_state(state: str, timestamp: int) -> None:
+    try:
+        write_config_value("last_stable_state", f"{state}:{int(timestamp)}", "pochino.yaml")
+    except Exception:
+        logger.exception("Failed to write last_stable_state to pochino.yaml")
+
+
+def get_fluctuation_count() -> int:
+    try:
+        config = load_yaml_config("pochino.yaml")
+        return int(config.get("fluctuation_count", 0))
+    except Exception:
+        return 0
+
+
+def set_fluctuation_count(count: int) -> None:
+    try:
+        write_config_value("fluctuation_count", int(count), "pochino.yaml")
+    except Exception:
+        logger.exception("Failed to write fluctuation_count to pochino.yaml")
 
 
 ## Formatting Helpers ##
@@ -61,15 +95,15 @@ def _send_response(handler, status, message):
     handler.wfile.write(message.encode("utf-8"))
 
 
-def _normalize_action_key(key):
-    if key is True:
-        return "on"
-    if key is False:
-        return "off"
-    return str(key).strip().lower()
+def _resolve_device_name(handler=None) -> str:
+    if handler and hasattr(handler, "headers") and handler.headers:
+        device_name = handler.headers.get("X-Pochino-Device", "").strip()
+        if device_name:
+            return device_name
+    return socket.gethostname()
 
 
-def send_alert(handler, action, config, timestamp, downtime=0, fluctuations=0) -> list[str]:
+def send_alert(action: str, config: dict, timestamp: float, downtime: int = 0, fluctuations: int = 0, device_name: str | None = None) -> list[str]:
     # Reload config to get the latest daily rate limit counters
     try:
         config_data = load_yaml_config("pochino.yaml")
@@ -85,7 +119,12 @@ def send_alert(handler, action, config, timestamp, downtime=0, fluctuations=0) -
     max_messages_per_day = alerts.get("max_messages_per_day", 50)
 
     try:
-        tz = ZoneInfo(get_server_timezone())
+        tz_name = get_server_timezone()
+    except Exception:
+        tz_name = "UTC"
+
+    try:
+        tz = ZoneInfo(tz_name)
     except Exception:
         tz = ZoneInfo("UTC")
     today = datetime.now(tz).strftime("%Y-%m-%d")
@@ -108,17 +147,21 @@ def send_alert(handler, action, config, timestamp, downtime=0, fluctuations=0) -
         logger.error("No message template found for action '%s'", action)
         return []
 
-    device_name = _resolve_device_name(handler)
-    formatted_time = format_timestamp(int(timestamp), get_server_timezone())
+    resolved_device = device_name or socket.gethostname()
+    try:
+        formatted_time = format_timestamp(int(timestamp), tz_name)
+    except Exception:
+        formatted_time = str(int(timestamp))
+
 
     if action == "on":
         downtime_str = format_duration(downtime)
         body = template + f"\n\nDowntime: {downtime_str}"
-        if fluctuations > 1:
+        if fluctuations > 0:
             body += f"\nPower fluctuations: {fluctuations}"
-        full_message = f"{body}\nDevice: {device_name}\nTime: {formatted_time}"
+        full_message = f"{body}\nDevice: {resolved_device}\nTime: {formatted_time}"
     else:
-        full_message = f"{template}\nDevice: {device_name}\nTime: {formatted_time}"
+        full_message = f"{template}\nDevice: {resolved_device}\nTime: {formatted_time}"
 
     failures = []
     for room_id in config["room_ids"]:
@@ -144,7 +187,6 @@ def send_alert(handler, action, config, timestamp, downtime=0, fluctuations=0) -
             failures.append(f"{room_id} (unexpected)")
             logger.exception("Pochino send failed for %s", room_id)
 
-    # Increment and persist daily messages counter
     messages_today += 1
     try:
         write_config_value("alerts.messages_today", messages_today, "pochino.yaml")
@@ -200,164 +242,118 @@ def _load_pochino_config():
     }
 
 
-def _resolve_device_name(handler):
-    device_name = handler.headers.get("X-Pochino-Device", "").strip()
-    if device_name:
-        return device_name
-    return socket.gethostname()
+## State Machine Workflows ##
 
+def _on_debounce_complete(action: str, trigger_timestamp: float, device_name: str, config: dict):
+    global _pending_action, _pending_since, _pending_device, _timer
 
-## Threading & State Machine Workflows ##
-
-def debounce_worker(gen, act, ts, handler, config):
-    global _pending_state, _pending_timestamp, _generation, _first_off_timestamp
-
-    # --- Phase 1: snapshot state under lock (fast, no I/O) ---
     with _lock:
-        if _generation != gen:
-            logger.info("Debounce worker (generation %d, action %s) discarded: newer webhook received", gen, act)
-            return
-        if _pending_state != act:
-            logger.info("Debounce worker (generation %d, action %s) discarded: pending state changed to %s", gen, act, _pending_state)
+        if _pending_action != action:
+            logger.info("Debounce completed for '%s' but current pending action is '%s'; discarded", action, _pending_action)
             return
 
-        # Capture and clear _first_off_timestamp atomically so no future
-        # cycle can accidentally reuse a stale value.
-        captured_first_off_ts = _first_off_timestamp
-        _first_off_timestamp = None
+        _pending_action = None
+        _timer = None
 
-    # --- Phase 2: read stable state (disk I/O, outside lock) ---
-    try:
-        stable_state, stable_timestamp = get_last_stable_state()
-    except Exception as exc:
-        logger.error("Failed to load last stable state: %s", exc)
-        stable_state, stable_timestamp = "on", int(ts)
-
-    if stable_state == act:
-        logger.info("State is already stable '%s', no transition needed", act)
-        return
-
-    logger.info("Transition to '%s' is stable", act)
-
-    try:
-        current_config = _load_pochino_config()
-    except Exception:
-        current_config = config
-
-    # --- Phase 3: perform transition (I/O-heavy, outside lock) ---
-    if act == "off":
-        # Use the first off timestamp from this outage cycle if available,
-        # otherwise fall back to this webhook's timestamp.
-        outage_ts = captured_first_off_ts if captured_first_off_ts is not None else ts
+        stable_state, stable_ts = get_last_stable_state()
+        if stable_state == action:
+            logger.info("State is already stable '%s', no transition needed", action)
+            return
 
         try:
-            set_last_stable_state("off", int(outage_ts))
+            current_config = _load_pochino_config()
         except Exception:
-            logger.exception("Failed to write stable state 'off'")
+            current_config = config
 
-        send_alert(handler, "off", current_config, timestamp=outage_ts)
+        fluctuations = get_fluctuation_count()
 
-    elif act == "on":
-        # Downtime = time from outage start to power-on webhook.
-        # Prefer the captured first-off timestamp (tracks the real outage start
-        # even across fluctuations), then the persisted stable-off timestamp.
-        if captured_first_off_ts is not None:
-            outage_start_timestamp = captured_first_off_ts
-        elif stable_state == "off":
-            outage_start_timestamp = stable_timestamp
-        else:
-            # stable_state is "on" and no first-off captured — shouldn't
-            # normally happen, but guard against it with zero downtime.
-            outage_start_timestamp = ts
+    # Outside lock: perform transitions and send alerts
+    if action == "off":
+        outage_ts = int(trigger_timestamp)
+        set_last_stable_state("off", outage_ts)
+        set_fluctuation_count(0)
+        logger.info("Transition to stable 'off' confirmed at timestamp %d", outage_ts)
+        send_alert("off", current_config, timestamp=outage_ts, device_name=device_name)
 
-        downtime = max(0, int(ts - outage_start_timestamp))
-        fluctuations = current_config.get("fluctuation_count", 0)
+    elif action == "on":
+        restore_ts = int(trigger_timestamp)
+        downtime = max(0, restore_ts - stable_ts) if stable_state == "off" else 0
+        logger.info(
+            "Transition to stable 'on' confirmed at %d. Downtime: %d seconds, fluctuations: %d",
+            restore_ts, downtime, fluctuations,
+        )
+        send_alert(
+            "on",
+            current_config,
+            timestamp=restore_ts,
+            downtime=downtime,
+            fluctuations=fluctuations,
+            device_name=device_name,
+        )
+        set_last_stable_state("on", restore_ts)
+        set_fluctuation_count(0)
 
-        send_alert(handler, "on", current_config, timestamp=ts, downtime=downtime, fluctuations=fluctuations)
 
-        try:
-            set_last_stable_state("on", int(ts))
-            write_config_value("fluctuation_count", 0, "pochino.yaml")
-        except Exception:
-            logger.exception("Failed to write stable state 'on' or reset fluctuations")
+def process_signal(action: str, device_name: str, config: dict, now: float | None = None) -> tuple[int, str]:
+    """
+    Core state machine logic.
+    Returns (http_status_code, response_message).
+    """
+    global _pending_action, _pending_since, _pending_device, _timer
 
-
-def handle_off(handler, config):
-    global _pending_state, _pending_timestamp, _generation, _first_off_timestamp
-    now = time.time()
+    if now is None:
+        now = time.time()
 
     with _lock:
-        try:
-            stable_state, _ = get_last_stable_state()
-        except Exception:
-            stable_state = "on"
+        stable_state, stable_ts = get_last_stable_state()
 
-        prev_pending = _pending_state
+        # 1. Duplicate check: If signal is already pending debounce, keep existing timer running!
+        if _pending_action == action:
+            logger.info("Pochino action '%s' is already pending debounce (since %s); ignoring duplicate", action, _pending_since)
+            return 200, f"Pochino {action} state change already pending"
 
-        # Detect fluctuation: an "on" was pending (or we were in a mid-cycle
-        # after an earlier off), meaning power flickered back on briefly and
-        # is now going off again.
-        if prev_pending == "on":
-            is_fluctuation = False
-            if stable_state == "off":
-                is_fluctuation = True
-            elif stable_state == "on" and _first_off_timestamp is not None:
-                is_fluctuation = True
+        # 2. Already stable check: If signal matches stable state and nothing is pending
+        if _pending_action is None and stable_state == action:
+            logger.info("State is already stable '%s', no transition needed", action)
+            return 200, f"Pochino state is already stable {action}"
 
-            if is_fluctuation:
-                try:
-                    config_data = load_yaml_config("pochino.yaml")
-                    fluctuation_count = config_data.get("fluctuation_count", 0)
-                    fluctuation_count += 1
-                    write_config_value("fluctuation_count", fluctuation_count, "pochino.yaml")
-                    logger.info("Outage fluctuation detected. Fluctuation count incremented to %d", fluctuation_count)
-                except Exception:
-                    logger.exception("Failed to update fluctuation count")
+        # 3. Handling opposing signals during debounce:
+        if _pending_action is not None:
+            if _timer is not None:
+                _timer.cancel()
+                _timer = None
 
-        _pending_state = "off"
-        _pending_timestamp = now
-        _generation += 1
-        current_generation = _generation
+            cancelled_action = _pending_action
+            _pending_action = None
 
-        # Record the first "off" of this outage cycle. Only set if we're
-        # coming from a known-on state and haven't already recorded one.
-        if _first_off_timestamp is None and stable_state == "on":
-            _first_off_timestamp = now
+            if stable_state == "off" and cancelled_action == "on" and action == "off":
+                # Power flickered ON briefly (< debounce) and went back OFF during an outage!
+                fluctuations = get_fluctuation_count() + 1
+                set_fluctuation_count(fluctuations)
+                logger.info("Outage fluctuation detected. Fluctuation count incremented to %d", fluctuations)
+                return 200, f"Outage fluctuation detected (count={fluctuations})"
 
-    debounce_seconds = config.get("debounce_seconds", 30)
+            if stable_state == "on" and cancelled_action == "off" and action == "on":
+                # Power dipped briefly (< debounce) but came back ON before stable OFF!
+                logger.info("Power flickered off then recovered before debounce; cancelled pending off")
+                return 200, "Pending powercut cancelled by recovery"
 
-    def worker_target():
-        time.sleep(debounce_seconds)
-        debounce_worker(current_generation, "off", now, handler, config)
+        # 4. Starting a new pending transition
+        _pending_action = action
+        _pending_since = now
+        _pending_device = device_name
+        debounce_seconds = config.get("debounce_seconds", 30)
 
-    t = threading.Thread(target=worker_target)
-    t.daemon = True
-    t.start()
+        _timer = threading.Timer(
+            debounce_seconds,
+            _on_debounce_complete,
+            args=[action, now, device_name, config],
+        )
+        _timer.daemon = True
+        _timer.start()
 
-    _send_response(handler, 200, "Pochino off state change pending")
-
-
-def handle_on(handler, config):
-    global _pending_state, _pending_timestamp, _generation, _first_off_timestamp
-    now = time.time()
-
-    with _lock:
-        _pending_state = "on"
-        _pending_timestamp = now
-        _generation += 1
-        current_generation = _generation
-
-    debounce_seconds = config.get("debounce_seconds", 30)
-
-    def worker_target():
-        time.sleep(debounce_seconds)
-        debounce_worker(current_generation, "on", now, handler, config)
-
-    t = threading.Thread(target=worker_target)
-    t.daemon = True
-    t.start()
-
-    _send_response(handler, 200, "Pochino on state change pending")
+        logger.info("Pochino %s state change pending (debounce %ds)", action, debounce_seconds)
+        return 200, f"Pochino {action} state change pending"
 
 
 ## Module Entrypoint ##
@@ -379,7 +375,6 @@ def handle(handler):
         _send_response(handler, 500, "Pochino config error")
         return
 
-    if action == "on":
-        handle_on(handler, config)
-    else:
-        handle_off(handler, config)
+    device_name = _resolve_device_name(handler)
+    status_code, message = process_signal(action, device_name, config)
+    _send_response(handler, status_code, message)

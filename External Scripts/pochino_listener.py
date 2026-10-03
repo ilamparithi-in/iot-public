@@ -19,7 +19,7 @@ def exit_with_error(message: str, code: int) -> None:
     sys.exit(code)
 
 
-def call_pochino_api(action: str, timeout_seconds: int = 5) -> None:
+def call_pochino_api(action: str, timeout_seconds: int = 5, max_retries: int = 5) -> None:
     url = f"{API_BASE_URL.rstrip('/')}/pochino/{action}"
     req = request.Request(
         url,
@@ -29,16 +29,23 @@ def call_pochino_api(action: str, timeout_seconds: int = 5) -> None:
         },
     )
 
-    try:
-        with request.urlopen(req, timeout=timeout_seconds) as response:
-            if response.status != 200:
-                body = response.read().decode("utf-8", errors="ignore")
-                print(f"Pochino API failed for {action}: HTTP {response.status} {body}", file=sys.stderr)
-    except error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="ignore")
-        print(f"Pochino API failed for {action}: HTTP {exc.code} {body}", file=sys.stderr)
-    except error.URLError as exc:
-        print(f"Pochino API network error for {action}: {exc.reason}", file=sys.stderr)
+    for attempt in range(max_retries):
+        try:
+            with request.urlopen(req, timeout=timeout_seconds) as response:
+                if response.status != 200:
+                    body = response.read().decode("utf-8", errors="ignore")
+                    print(f"Pochino API failed for {action}: HTTP {response.status} {body}", file=sys.stderr)
+                return
+        except error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="ignore")
+            print(f"Pochino API failed for {action}: HTTP {exc.code} {body}", file=sys.stderr)
+            return
+        except error.URLError as exc:
+            if attempt < max_retries - 1:
+                time.sleep(2)
+                continue
+            print(f"Pochino API network error for {action}: {exc.reason}", file=sys.stderr)
+
 
 
 def main() -> None:
