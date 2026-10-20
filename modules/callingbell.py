@@ -44,8 +44,9 @@ class RTSPMonitor(threading.Thread):
 
     def run(self):
         logger.info("RTSP Monitor thread started")
+        reported_unavailable = False
         while not self.stop_event.is_set():
-            logger.info("RTSP reconnect attempt")
+            logger.debug("RTSP reconnect attempt")
             cap = cv2.VideoCapture(self.uri)
             with self.buffer_lock:
                 if self.stop_event.is_set():
@@ -54,7 +55,11 @@ class RTSPMonitor(threading.Thread):
                 self.cap = cap
 
             if not cap.isOpened():
-                logger.warning("RTSP camera unavailable")
+                if not reported_unavailable:
+                    logger.warning("RTSP camera unavailable")
+                    reported_unavailable = True
+                with self.buffer_lock:
+                    self.cap = None
                 cap.release()
                 # Wait 5 seconds before retrying, checking stop_event frequently
                 for _ in range(50):
@@ -64,6 +69,7 @@ class RTSPMonitor(threading.Thread):
                 continue
 
             logger.info("RTSP connected")
+            reported_unavailable = False
             last_stored_time = 0.0
 
             while not self.stop_event.is_set():
