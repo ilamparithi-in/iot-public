@@ -378,3 +378,65 @@ def handle(handler):
     device_name = _resolve_device_name(handler)
     status_code, message = process_signal(action, device_name, config)
     _send_response(handler, status_code, message)
+
+
+def _initialize_at_startup():
+    def _startup_worker():
+        with _lock:
+            try:
+                stable_state, stable_ts = get_last_stable_state()
+            except Exception as exc:
+                logger.warning("Startup state check failed: %s", exc)
+                return
+
+            if stable_state != "off":
+                logger.debug("Pochino startup: state is '%s', no restoration needed", stable_state)
+                return
+
+            try:
+                config = _load_pochino_config()
+            except Exception as exc:
+                logger.error("Pochino startup config error: %s", exc)
+                return
+
+            now = int(time.time())
+            downtime = max(0, now - stable_ts)
+            fluctuations = get_fluctuation_count()
+            device_name = _resolve_device_name()
+
+            # Persist state as 'on' immediately to prevent duplicate alerts or transitions
+            set_last_stable_state("on", now)
+            set_fluctuation_count(0)
+
+        logger.info(
+            "Pochino startup recovery: previous state was 'off', current state is 'on'. Downtime: %d seconds, fluctuations: %d",
+            downtime,
+            fluctuations,
+        )
+
+        max_retries = 5
+        for attempt in range(max_retries):
+            failures = send_alert(
+                "on",
+                config,
+                timestamp=now,
+                downtime=downtime,
+                fluctuations=fluctuations,
+                device_name=device_name,
+            )
+            if not failures or not any("network" in f for f in failures):
+                break
+            if attempt < max_retries - 1:
+                logger.info(
+                    "Startup alert send failed due to network, retrying in 2s (attempt %d/%d)...",
+                    attempt + 1,
+                    max_retries,
+                )
+                time.sleep(2)
+
+    t = threading.Thread(target=_startup_worker, daemon=True, name="PochinoStartupRecovery")
+    t.start()
+
+
+# Initialize at startup
+_initialize_at_startup()
